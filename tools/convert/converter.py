@@ -27,11 +27,6 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from lightx2v.utils.registry_factory import CONVERT_WEIGHT_REGISTER
 from tools.convert.quant import *
 
-dtype_mapping = {
-    "int8": torch.int8,
-    "fp8": torch.float8_e4m3fn,
-}
-
 
 def get_key_mapping_rules(direction, model_type):
     if model_type == "wan_dit":
@@ -311,6 +306,59 @@ def get_key_mapping_rules(direction, model_type):
         raise ValueError(f"Unsupported model type: {model_type}")
 
 
+def quantize_tensor(w, w_bit=8, dtype=torch.int8, comfyui_mode=False):
+    """
+    Quantize a 2D tensor to specified bit width using symmetric min-max quantization
+
+    Args:
+        w: Input tensor to quantize (must be 2D)
+        w_bit: Quantization bit width (default: 8)
+
+    Returns:
+        quantized: Quantized tensor (int8)
+        scales: Scaling factors per row
+    """
+    if w.dim() != 2:
+        raise ValueError(f"Only 2D tensors supported. Got {w.dim()}D tensor")
+    if torch.isnan(w).any():
+        raise ValueError("Tensor contains NaN values")
+    if w_bit != 8:
+        raise ValueError("Only support 8 bits")
+
+    org_w_shape = w.shape
+    # Calculate quantization parameters
+    if not comfyui_mode:
+        max_val = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
+    else:
+        max_val = w.abs().max()
+
+    if dtype == torch.float8_e4m3fn:
+        finfo = torch.finfo(dtype)
+        qmin, qmax = finfo.min, finfo.max
+    elif dtype == torch.int8:
+        qmin, qmax = -128, 127
+    # Quantize tensor
+    scales = max_val / qmax
+
+    if dtype == torch.float8_e4m3fn:
+        from qtorch.quant import float_quantize
+
+        scaled_tensor = w / scales
+        scaled_tensor = torch.clip(scaled_tensor, qmin, qmax)
+        w_q = float_quantize(scaled_tensor.float(), 4, 3, rounding="nearest").to(dtype)
+    else:
+        w_q = torch.clamp(torch.round(w / scales), qmin, qmax).to(dtype)
+
+    assert torch.isnan(scales).sum() == 0
+    assert torch.isnan(w_q).sum() == 0
+
+    if not comfyui_mode:
+        scales = scales.view(org_w_shape[0], -1)
+        w_q = w_q.reshape(org_w_shape)
+
+    return w_q, scales
+
+
 def quantize_model(
     weights,
     w_bit=8,
@@ -318,10 +366,11 @@ def quantize_model(
     adapter_keys=None,
     key_idx=2,
     ignore_key=None,
-    linear_type="int8",
+    linear_dtype=torch.int8,
     non_linear_dtype=torch.float,
     comfyui_mode=False,
     comfyui_keys=[],
+    linear_quant_type=None,
 ):
     """
     Quantize model weights in-place
@@ -334,11 +383,24 @@ def quantize_model(
     Returns:
         Modified state dictionary with quantized weights and scales
     """
+    if not weights or len(weights) == 0:
+        logger.error("ERROR: weights dictionary is empty! Cannot quantize.")
+        logger.error("Please check:")
+        logger.error("  1. Source path contains .safetensors files")
+        logger.error("  2. Model files are not corrupted")
+        logger.error("  3. Source path is correct")
+        raise ValueError("weights dictionary is empty")
+
     total_quantized = 0
     original_size = 0
     quantized_size = 0
     non_quantized_size = 0
     keys = list(weights.keys())
+    logger.info(f"Total weights to process: {len(keys)}")
+    logger.info(f"Target keys for quantization: {target_keys}")
+    logger.info(f"Key index: {key_idx}")
+    logger.info(f"Ignore keys: {ignore_key}")
+    logger.info(f"Sample weight keys (first 5): {keys[:5]}")
 
     with tqdm(keys, desc="Quantizing weights") as pbar:
         for key in pbar:
@@ -386,9 +448,13 @@ def quantize_model(
             original_size += original_tensor_size
 
             # Quantize tensor and store results
-            quantizer = CONVERT_WEIGHT_REGISTER[linear_type](tensor)
-            w_q, scales, extra = quantizer.weight_quant_func(tensor, comfyui_mode)
-            weight_global_scale = extra.get("weight_global_scale", None)  # For nvfp4
+            if linear_quant_type:
+                quantizer = CONVERT_WEIGHT_REGISTER[linear_quant_type](tensor)
+                w_q, scales, extra = quantizer.weight_quant_func(tensor)
+                weight_global_scale = extra.get("weight_global_scale", None)  # For nvfp4
+            else:
+                w_q, scales = quantize_tensor(tensor, w_bit, linear_dtype, comfyui_mode)
+                weight_global_scale = None
 
             # Replace original tensor and store scales
             weights[key] = w_q
@@ -422,7 +488,11 @@ def quantize_model(
     logger.info(f"After quantization size: {quantized_size_mb:.2f} MB (includes scales)")
     logger.info(f"Non-quantized tensors size: {non_quantized_size_mb:.2f} MB")
     logger.info(f"Total final model size: {total_final_size_mb:.2f} MB")
-    logger.info(f"Size reduction in quantized tensors: {size_reduction_mb:.2f} MB ({size_reduction_mb / original_size_mb * 100:.1f}%)")
+    if original_size_mb > 0:
+        logger.info(f"Size reduction in quantized tensors: {size_reduction_mb:.2f} MB ({size_reduction_mb / original_size_mb * 100:.1f}%)")
+    else:
+        logger.warning("No tensors were quantized. Please check target_keys and model structure.")
+        logger.info(f"Size reduction in quantized tensors: {size_reduction_mb:.2f} MB (N/A - no tensors quantized)")
 
     if comfyui_mode:
         weights["scaled_fp8"] = torch.zeros(2, dtype=torch.float8_e4m3fn)
@@ -460,8 +530,15 @@ def load_loras(lora_path, weight_dict, alpha, key_mapping_rules=None, strength=1
 
 
 def convert_weights(args):
+    # import pdb
+    # pdb.set_trace()
     if os.path.isdir(args.source):
-        src_files = glob.glob(os.path.join(args.source, "*.safetensors"), recursive=True)
+        # Search for safetensors files recursively
+        pattern1 = os.path.join(args.source, "*.safetensors")
+        pattern2 = os.path.join(args.source, "**", "*.safetensors")
+        src_files = glob.glob(pattern1, recursive=False) + glob.glob(pattern2, recursive=True)
+        src_files = list(set(src_files))  # Remove duplicates
+        src_files.sort()  # Sort for consistent ordering
     elif args.source.endswith((".pth", ".safetensors", "pt")):
         src_files = [args.source]
     else:
@@ -469,6 +546,14 @@ def convert_weights(args):
 
     merged_weights = {}
     logger.info(f"Processing source files: {src_files}")
+    
+    if not src_files:
+        logger.error(f"ERROR: No .safetensors files found in source path: {args.source}")
+        logger.error("Please check:")
+        logger.error("  1. Source path is correct")
+        logger.error("  2. Model files have .safetensors extension")
+        logger.error("  3. Files are not in subdirectories (use recursive search if needed)")
+        raise ValueError(f"No .safetensors files found in: {args.source}")
 
     # Optimize loading for better memory usage
     for file_path in tqdm(src_files, desc="Loading weights"):
@@ -497,11 +582,17 @@ def convert_weights(args):
 
         # Update weights more efficiently
         merged_weights.update(weights)
+        logger.info(f"Loaded {len(weights)} keys from {os.path.basename(file_path)}, total keys: {len(merged_weights)}")
 
         # Clear weights dict to free memory
         del weights
         if len(src_files) > 1:
             gc.collect()  # Force garbage collection between files
+
+    logger.info(f"Total merged weights: {len(merged_weights)} keys")
+    if len(merged_weights) == 0:
+        logger.error("ERROR: No weights loaded! All source files appear to be empty or corrupted.")
+        raise ValueError("No weights loaded from source files")
 
     if args.direction is not None:
         rules = get_key_mapping_rules(args.direction, args.model_type)
@@ -544,6 +635,11 @@ def convert_weights(args):
     else:
         converted_weights = merged_weights
 
+    logger.info(f"Total converted weights: {len(converted_weights)} keys")
+    if len(converted_weights) == 0:
+        logger.error("ERROR: converted_weights is empty after key conversion!")
+        raise ValueError("converted_weights is empty")
+
     # Apply LoRA AFTER key conversion to ensure proper key matching
     if args.lora_path is not None:
         # Handle alpha list - if single alpha, replicate for all LoRAs
@@ -582,12 +678,13 @@ def convert_weights(args):
             load_loras(path, converted_weights, alpha, key_mapping_rules, strength=strength)
 
     if args.quantized:
+        logger.info(f"Starting quantization with {len(converted_weights)} weights")
         if args.full_quantized and args.comfyui_mode:
             logger.info("Quant all tensors...")
-            assert args.linear_dtype, f"Error: only support 'torch.int8' and 'torch.float8_e4m3fn'."
             for k in converted_weights.keys():
                 converted_weights[k] = converted_weights[k].float().to(args.linear_dtype)
         else:
+            logger.info(f"Calling quantize_model with {len(converted_weights)} weights")
             converted_weights = quantize_model(
                 converted_weights,
                 w_bit=args.bits,
@@ -595,10 +692,11 @@ def convert_weights(args):
                 adapter_keys=args.adapter_keys,
                 key_idx=args.key_idx,
                 ignore_key=args.ignore_key,
-                linear_type=args.linear_type,
+                linear_dtype=args.linear_dtype,
                 non_linear_dtype=args.non_linear_dtype,
                 comfyui_mode=args.comfyui_mode,
                 comfyui_keys=args.comfyui_keys,
+                linear_quant_type=args.linear_quant_type,
             )
 
     os.makedirs(args.output, exist_ok=True)
@@ -747,7 +845,7 @@ def main():
     parser.add_argument(
         "-t",
         "--model_type",
-        choices=["wan_dit", "hunyuan_dit", "wan_t5", "wan_clip", "wan_animate_dit", "qwen_image_dit", "qwen25vl_llm"],
+        choices=["wan_dit", "hunyuan_dit", "wan_t5", "wan_clip", "wan_animate_dit", "qwen_image_dit"],
         default="wan_dit",
         help="Model type",
     )
@@ -765,10 +863,16 @@ def main():
         help="Device to use for quantization (cpu/cuda)",
     )
     parser.add_argument(
-        "--linear_type",
+        "--linear_dtype",
         type=str,
-        choices=["int8", "fp8", "nvfp4", "mxfp4", "mxfp6", "mxfp8"],
-        help="Quant type for linear",
+        choices=["torch.int8", "torch.float8_e4m3fn"],
+        help="Data type for linear",
+    )
+    parser.add_argument(
+        "--linear_quant_type",
+        type=str,
+        choices=["INT8", "FP8", "NVFP4", "MXFP4", "MXFP6", "MXFP8"],
+        help="Data type for linear",
     )
     parser.add_argument(
         "--non_linear_dtype",
@@ -811,8 +915,10 @@ def main():
         logger.warning("--chunk_size is ignored when using --single_file option.")
 
     if args.quantized:
-        args.linear_dtype = dtype_mapping.get(args.linear_type, None)
-        args.non_linear_dtype = eval(args.non_linear_dtype)
+        if args.linear_dtype is not None:
+            args.linear_dtype = eval(args.linear_dtype)
+        if args.non_linear_dtype is not None:
+            args.non_linear_dtype = eval(args.non_linear_dtype)
 
         model_type_keys_map = {
             "qwen_image_dit": {
@@ -838,17 +944,16 @@ def main():
                 "key_idx": 2,
                 "target_keys": [
                     "img_mod",
-                    "img_attn_q",
-                    "img_attn_k",
-                    "img_attn_v",
+                    "img_attn_qkv",
                     "img_attn_proj",
                     "img_mlp",
                     "txt_mod",
-                    "txt_attn_q",
-                    "txt_attn_k",
-                    "txt_attn_v",
+                    "txt_attn_qkv",
                     "txt_attn_proj",
                     "txt_mlp",
+                    "linear1",
+                    "linear2",
+                    "modulation",
                 ],
                 "ignore_key": None,
             },
@@ -856,12 +961,7 @@ def main():
             "wan_clip": {
                 "key_idx": 3,
                 "target_keys": ["attn", "mlp"],
-                "ignore_key": ["textual"],
-            },
-            "qwen25vl_llm": {
-                "key_idx": 3,
-                "target_keys": ["self_attn", "mlp"],
-                "ignore_key": ["visual"],
+                "ignore_key": "textual",
             },
         }
 
